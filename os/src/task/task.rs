@@ -1,10 +1,12 @@
 //! Types related to task management & Functions for completely changing TCB
-use super::TaskContext;
+use super::{current_task, TaskContext};
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 use crate::config::TRAP_CONTEXT_BASE;
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
+use crate::syscall::process::TaskInfo;
+use crate::timer::get_time_ms;
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -24,6 +26,12 @@ pub struct TaskControlBlock {
 
     /// Mutable
     inner: UPSafeCell<TaskControlBlockInner>,
+
+    /// The stride of the task
+    pub stride: isize,
+
+    /// The priority of the task
+    pub priority: isize,
 }
 
 impl TaskControlBlock {
@@ -50,7 +58,7 @@ pub struct TaskControlBlockInner {
     pub task_cx: TaskContext,
 
     /// Maintain the execution status of the current process
-    pub task_status: TaskStatus,
+    pub task_info: TaskInfo,
 
     /// Application address space
     pub memory_set: MemorySet,
@@ -64,6 +72,8 @@ pub struct TaskControlBlockInner {
 
     /// It is set when active exit or execution error occurs
     pub exit_code: i32,
+
+    /// File Descriptor Table: Record the files opened by this task
     pub fd_table: Vec<Option<Arc<dyn File + Send + Sync>>>,
 
     /// Heap bottom
@@ -81,7 +91,7 @@ impl TaskControlBlockInner {
         self.memory_set.token()
     }
     fn get_status(&self) -> TaskStatus {
-        self.task_status
+        self.task_info.status
     }
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
@@ -120,7 +130,7 @@ impl TaskControlBlock {
                     trap_cx_ppn,
                     base_size: user_sp,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
-                    task_status: TaskStatus::Ready,
+                    task_info: TaskInfo::new_s(TaskStatus::Ready),
                     memory_set,
                     parent: None,
                     children: Vec::new(),
@@ -134,9 +144,11 @@ impl TaskControlBlock {
                         Some(Arc::new(Stdout)),
                     ],
                     heap_bottom: user_sp,
-                    program_brk: user_sp,
+                    program_brk: user_sp
                 })
             },
+            stride: 0,
+            priority: 0,
         };
         // prepare TrapContext in user space
         let trap_cx = task_control_block.inner_exclusive_access().get_trap_cx();
@@ -208,16 +220,18 @@ impl TaskControlBlock {
                     trap_cx_ppn,
                     base_size: parent_inner.base_size,
                     task_cx: TaskContext::goto_trap_return(kernel_stack_top),
-                    task_status: TaskStatus::Ready,
+                    task_info: TaskInfo::new_s(TaskStatus::Ready),
                     memory_set,
                     parent: Some(Arc::downgrade(self)),
                     children: Vec::new(),
                     exit_code: 0,
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
-                    program_brk: parent_inner.program_brk,
+                    program_brk: parent_inner.program_brk
                 })
             },
+            stride: self.stride,
+            priority: self.priority,
         });
         // add child
         parent_inner.children.push(task_control_block.clone());
@@ -260,6 +274,40 @@ impl TaskControlBlock {
         } else {
             None
         }
+    }
+
+    /// Run a child process in current process
+    pub fn spawn(&self, elf_data: &[u8]) -> Arc<TaskControlBlock> {
+        let current_task = current_task().unwrap();
+        let new_task = Arc::new(TaskControlBlock::new(&elf_data));
+
+        current_task.inner_exclusive_access().children.push(new_task.clone());
+        new_task.inner_exclusive_access().parent = Some(Arc::downgrade(&current_task));
+
+        new_task
+    } 
+
+    /// set the priority of the task
+    pub fn set_priority(self: &mut Arc<TaskControlBlock>, priority: isize) -> isize {
+        if priority < 2 {
+            return -1;
+        }
+        let aa = Arc::get_mut(self).unwrap();
+        aa.priority = priority;
+        priority
+    }
+
+    /// fetch the task info
+    pub fn get_task_info(&self) -> TaskInfo {
+        let mut info = self.inner_exclusive_access().task_info;
+        info.time = get_time_ms() - info.time;
+        info
+    }
+
+    /// trace the system call of the task
+    pub fn trace_syscall(&self, syscall_num: usize) {
+        let mut inner = self.inner_exclusive_access();
+        inner.task_info.syscall_times[syscall_num] += 1;
     }
 }
 
