@@ -15,11 +15,14 @@
 //! might not be what you expect.
 mod context;
 mod id;
+
 mod manager;
 mod processor;
 mod switch;
 #[allow(clippy::module_inception)]
 mod task;
+
+use crate::{config::MAX_SYSCALL_NUM, timer::get_time_ms};
 
 use crate::loader::get_app_data_by_name;
 use alloc::sync::Arc;
@@ -52,6 +55,57 @@ pub fn suspend_current_and_run_next() {
     add_task(task);
     // jump to scheduling cycle
     schedule(task_cx_ptr);
+}
+
+/// We trace the syscalls with this method.
+pub fn trace_syscall(syscall_id: usize) -> usize {
+    // There must be an application running.
+    let task = match current_task() {
+        Some(t) => t,
+        _ => {
+            println!("THIS");
+            return 1
+        }
+    };
+    // ---- access current TCB exclusively
+    let mut inner = task.inner_exclusive_access();
+    inner.syscall_times[syscall_id % MAX_SYSCALL_NUM] += 1;
+    0
+}
+
+use crate::syscall::TaskInfo;
+
+/// Fetch task info
+pub fn fetch_task_info() -> TaskInfo {
+    // There must be an application running.
+    let task = current_task().unwrap();
+    // ---- access current TCB exclusively
+    let inner = task.inner_exclusive_access();
+    TaskInfo {
+        time: get_time_ms() - inner.time,
+        status: inner.task_status,
+        syscall_times: inner.syscall_times
+    }
+}
+
+/// mmap operation
+pub fn current_task_memset_mmap(start: usize, len: usize, port: usize) -> isize {
+    // There must be an application running.
+    let task = current_task().unwrap();
+    // ---- access current TCB exclusively
+    let mut inner = task.inner_exclusive_access();
+    let ms = &mut inner.memory_set;
+    ms.mmap(start, len, port)
+}
+
+/// munmap operation
+pub fn current_task_memset_munmap(start: usize, len: usize) -> isize {
+    // There must be an application running.
+    let task = current_task().unwrap();
+    // ---- access current TCB exclusively
+    let mut inner = task.inner_exclusive_access();
+    let ms = &mut inner.memory_set;
+    ms.munmap(start, len)
 }
 
 /// pid of usertests app in make run TEST=1
